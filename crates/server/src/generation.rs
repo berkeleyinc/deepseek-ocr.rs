@@ -83,11 +83,20 @@ async fn generate_multipage_async(
     prompt: String,
     images: Vec<DynamicImage>,
     params: DecodeParameters,
-    _stream: Option<StreamContext>,
+    stream: Option<StreamContext>,
 ) -> Result<GenerationResult, ApiError> {
+    use crate::stream::StreamController;
+
     let mut combined_text = String::new();
     let mut total_prompt_tokens = 0;
     let mut total_response_tokens = 0;
+
+    // Create stream controller if streaming is enabled
+    let stream_controller = stream.as_ref().map(|ctx| {
+        let controller = StreamController::new(Arc::clone(&inputs.tokenizer), ctx.clone());
+        controller.send_initial();
+        controller
+    });
 
     // Process each page separately
     for (page_num, image) in images.into_iter().enumerate() {
@@ -104,23 +113,52 @@ async fn generate_multipage_async(
                 vec![image],
                 page_inputs.vision,
                 page_params,
-                None,
+                None, // Don't stream individual pages, we'll stream page-by-page instead
             )
         })
         .await;
 
         let result = match join_result {
             Ok(Ok(r)) => r,
-            Ok(Err(err)) => return Err(err),
-            Err(err) => return Err(ApiError::Internal(format!("page {} generation failed: {err}", page_num + 1))),
+            Ok(Err(err)) => {
+                if let Some(ref ctx) = stream {
+                    ctx.send_error(&err.to_string());
+                }
+                return Err(err);
+            }
+            Err(err) => {
+                let api_err = ApiError::Internal(format!("page {} generation failed: {err}", page_num + 1));
+                if let Some(ref ctx) = stream {
+                    ctx.send_error(&api_err.to_string());
+                }
+                return Err(api_err);
+            }
         };
 
+        // Add page separator before subsequent pages
         if !combined_text.is_empty() {
-            combined_text.push_str("\n\n<--- Page Split --->\n\n");
+            let separator = "\n\n<--- Page Split --->\n\n";
+            combined_text.push_str(separator);
+
+            // Stream the separator if streaming
+            if let Some(ref controller) = stream_controller {
+                controller.emit_fallback(separator);
+            }
         }
+
         combined_text.push_str(&result.text);
         total_prompt_tokens += result.prompt_tokens;
         total_response_tokens += result.response_tokens;
+
+        // Stream the page result if streaming
+        if let Some(ref controller) = stream_controller {
+            controller.emit_fallback(&result.text);
+        }
+    }
+
+    // Finalize streaming if enabled
+    if let Some(ref controller) = stream_controller {
+        controller.finalize(&combined_text, total_prompt_tokens, total_response_tokens);
     }
 
     Ok(GenerationResult {
@@ -228,29 +266,6 @@ pub fn convert_messages(
         ModelKind::Deepseek => convert_deepseek_messages(messages),
         ModelKind::PaddleOcrVl | ModelKind::DotsOcr => convert_paddle_messages(messages),
     }
-}
-
-pub fn has_multiple_images(messages: &[ApiMessage]) -> bool {
-    let mut image_count = 0;
-    for message in messages {
-        match &message.content {
-            MessageContent::Parts(parts) => {
-                for part in parts {
-                    match part {
-                        MessagePart::ImageUrl { .. } | MessagePart::InputImage { .. } => {
-                            image_count += 1;
-                            if image_count > 1 {
-                                return true;
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    false
 }
 
 fn convert_deepseek_messages(
