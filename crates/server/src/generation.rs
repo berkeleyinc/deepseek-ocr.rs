@@ -95,8 +95,8 @@ async fn generate_multipage_async(
     // to avoid complexity with multiple finalization events
     for (page_num, image) in images.into_iter().enumerate() {
         let page_inputs = inputs.clone();
-        let page_prompt = prompt.replace("<image><image>", "<image>")
-            .replacen("<image>", "<image>", 1); // Keep only first <image> placeholder
+        // Use the same prompt for all pages (it already has exactly one <image> placeholder)
+        let page_prompt = prompt.clone();
         let page_params = params.clone();
 
         let join_result = tokio::task::spawn_blocking(move || {
@@ -328,10 +328,9 @@ fn flatten_content(content: &MessageContent) -> Result<(String, Vec<DynamicImage
                 match part {
                     MessagePart::ImageUrl { image_url } | MessagePart::InputImage { image_url } => {
                         let mut loaded_images = load_image_or_pdf(image_url)?;
-                        // Add <image> placeholder for each image/page
-                        for _ in 0..loaded_images.len() {
-                            buffer.push_str("<image>");
-                        }
+                        // Only add ONE <image> placeholder, even for multi-page PDFs
+                        // The multipage handler will process each page separately with the same prompt
+                        buffer.push_str("<image>");
                         images.append(&mut loaded_images);
                     }
                     MessagePart::Text { text } | MessagePart::InputText { text } => {
