@@ -91,8 +91,14 @@ async fn generate_multipage_async(
     let mut total_prompt_tokens = 0;
     let mut total_response_tokens = 0;
 
-    // For multi-page PDFs, we process each page sequentially without per-page streaming
-    // to avoid complexity with multiple finalization events
+    // Set up streaming controller if streaming is enabled
+    let stream_controller = stream.as_ref().map(|ctx| {
+        let controller = StreamController::new(Arc::clone(&inputs.tokenizer), ctx.clone());
+        controller.send_initial();
+        controller
+    });
+
+    // Process each page and stream results as they complete
     for (page_num, image) in images.into_iter().enumerate() {
         let page_inputs = inputs.clone();
         // Use the same prompt for all pages (it already has exactly one <image> placeholder)
@@ -107,7 +113,7 @@ async fn generate_multipage_async(
                 vec![image],
                 page_inputs.vision,
                 page_params,
-                None, // No per-page streaming for multi-page documents
+                None, // No per-token streaming for individual pages
             )
         })
         .await;
@@ -131,19 +137,28 @@ async fn generate_multipage_async(
 
         // Add page separator before subsequent pages
         if !combined_text.is_empty() {
-            combined_text.push_str("\n\n<--- Page Split --->\n\n");
+            let separator = "\n\n<--- Page Split --->\n\n";
+            combined_text.push_str(separator);
+
+            // Stream the separator immediately if streaming
+            if let Some(ref controller) = stream_controller {
+                controller.emit_text(separator);
+            }
         }
 
         combined_text.push_str(&result.text);
         total_prompt_tokens += result.prompt_tokens;
         total_response_tokens += result.response_tokens;
+
+        // Stream this page's result immediately
+        if let Some(ref controller) = stream_controller {
+            controller.emit_text(&result.text);
+        }
     }
 
-    // If streaming was requested, send the complete result as a streamed fallback
-    if let Some(ctx) = stream {
-        let controller = StreamController::new(Arc::clone(&inputs.tokenizer), ctx);
-        controller.send_initial();
-        controller.emit_fallback(&combined_text);
+    // Finalize the stream with complete results
+    if let Some(ref controller) = stream_controller {
+        controller.finalize(&combined_text, total_prompt_tokens, total_response_tokens);
     }
 
     Ok(GenerationResult {

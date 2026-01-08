@@ -133,6 +133,10 @@ impl StreamController {
         self.inner.emit_delta(text.to_string(), true);
         self.inner.finalize(text, 0, 0);
     }
+
+    pub fn emit_text(&self, text: &str) {
+        self.inner.emit_delta(text.to_string(), false);
+    }
 }
 
 impl StreamControllerInner {
