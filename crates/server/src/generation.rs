@@ -3,6 +3,7 @@ use std::{convert::TryFrom, sync::Arc};
 use base64::Engine;
 use deepseek_ocr_core::{DecodeOutcome, DecodeParameters, ModelKind, VisionSettings};
 use image::DynamicImage;
+use pdfium_render::prelude::*;
 use reqwest::blocking::Client;
 use rocket::tokio;
 use tokenizers::Tokenizer;
@@ -246,8 +247,12 @@ fn flatten_content(content: &MessageContent) -> Result<(String, Vec<DynamicImage
             for part in parts.iter().rev() {
                 match part {
                     MessagePart::ImageUrl { image_url } | MessagePart::InputImage { image_url } => {
-                        buffer.push_str("<image>");
-                        images.push(load_image(image_url)?);
+                        let mut loaded_images = load_image_or_pdf(image_url)?;
+                        // Add <image> placeholder for each page/image
+                        for _ in 0..loaded_images.len() {
+                            buffer.push_str("<image>");
+                        }
+                        images.append(&mut loaded_images);
                     }
                     MessagePart::Text { text } | MessagePart::InputText { text } => {
                         if !buffer.is_empty() {
@@ -262,20 +267,66 @@ fn flatten_content(content: &MessageContent) -> Result<(String, Vec<DynamicImage
     }
 }
 
-fn load_image(spec: &ImagePayload) -> Result<DynamicImage, ApiError> {
+fn load_image_or_pdf(spec: &ImagePayload) -> Result<Vec<DynamicImage>, ApiError> {
     let url = spec.url();
     if let Some(rest) = url.strip_prefix("data:") {
-        return load_data_url(rest);
+        return load_data_url_or_pdf(rest);
     }
     if url.starts_with("http://") || url.starts_with("https://") {
-        return fetch_remote_image(url);
+        return fetch_remote_image_or_pdf(url);
     }
     Err(ApiError::BadRequest(
-        "only data: URIs or http(s) image URLs are supported".into(),
+        "only data: URIs or http(s) image/PDF URLs are supported".into(),
     ))
 }
 
-fn load_data_url(data: &str) -> Result<DynamicImage, ApiError> {
+fn convert_pdf_to_images(pdf_data: &[u8]) -> Result<Vec<DynamicImage>, ApiError> {
+    let pdfium = Pdfium::new(
+        Pdfium::bind_to_system_library()
+            .map_err(|err| ApiError::Internal(format!("failed to initialize PDF library: {err}")))?,
+    );
+
+    let document = pdfium
+        .load_pdf_from_byte_slice(pdf_data, None)
+        .map_err(|err| ApiError::BadRequest(format!("failed to load PDF: {err}")))?;
+
+    let mut images = Vec::new();
+
+    for page_index in 0..document.pages().len() {
+        let page = document
+            .pages()
+            .get(page_index)
+            .map_err(|err| ApiError::Internal(format!("failed to get PDF page {}: {err}", page_index)))?;
+
+        // Render at 2x scale (144 DPI) for better quality OCR
+        let render_config = PdfRenderConfig::new()
+            .set_target_width(2000)
+            .set_maximum_width(4000)
+            .rotate_if_landscape(PdfPageRenderRotation::None, true);
+
+        let bitmap = page
+            .render_with_config(&render_config)
+            .map_err(|err| ApiError::Internal(format!("failed to render PDF page {}: {err}", page_index)))?;
+
+        let width = bitmap.width() as u32;
+        let height = bitmap.height() as u32;
+
+        // Convert RGBA bitmap to DynamicImage
+        let buffer = bitmap.as_raw_bytes().to_vec();
+        let img = image::RgbaImage::from_raw(width, height, buffer)
+            .ok_or_else(|| ApiError::Internal(format!("failed to create image from PDF page {}", page_index)))?;
+
+        images.push(DynamicImage::ImageRgba8(img));
+    }
+
+    if images.is_empty() {
+        return Err(ApiError::BadRequest("PDF contains no pages".into()));
+    }
+
+    Ok(images)
+}
+
+fn load_data_url_or_pdf(data: &str) -> Result<Vec<DynamicImage>, ApiError> {
     let (meta, payload) = data
         .split_once(',')
         .ok_or_else(|| ApiError::BadRequest("invalid data URL".into()))?;
@@ -286,22 +337,52 @@ fn load_data_url(data: &str) -> Result<DynamicImage, ApiError> {
     }
     let decoded = base64::engine::general_purpose::STANDARD
         .decode(payload)
-        .map_err(|err| ApiError::BadRequest(format!("invalid base64 image payload: {err}")))?;
-    image::load_from_memory(&decoded)
-        .map_err(|err| ApiError::BadRequest(format!("failed to decode inline image: {err}")))
+        .map_err(|err| ApiError::BadRequest(format!("invalid base64 payload: {err}")))?;
+
+    // Check if it's a PDF by looking at the MIME type or magic bytes
+    let is_pdf = meta.starts_with("application/pdf") || decoded.starts_with(b"%PDF");
+
+    if is_pdf {
+        // Convert PDF pages to images
+        convert_pdf_to_images(&decoded)
+    } else {
+        // Load as a single image
+        let img = image::load_from_memory(&decoded)
+            .map_err(|err| ApiError::BadRequest(format!("failed to decode inline image: {err}")))?;
+        Ok(vec![img])
+    }
 }
 
-fn fetch_remote_image(url: &str) -> Result<DynamicImage, ApiError> {
+fn fetch_remote_image_or_pdf(url: &str) -> Result<Vec<DynamicImage>, ApiError> {
     let client = Client::new();
     let response = client
         .get(url)
         .send()
         .map_err(|err| ApiError::BadRequest(format!("failed to fetch {url}: {err}")))?
         .error_for_status()
-        .map_err(|err| ApiError::BadRequest(format!("image request failed for {url}: {err}")))?;
+        .map_err(|err| ApiError::BadRequest(format!("request failed for {url}: {err}")))?;
+
+    // Check content type
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.to_string())
+        .unwrap_or_default();
+
     let bytes = response
         .bytes()
-        .map_err(|err| ApiError::BadRequest(format!("failed to read image body: {err}")))?;
-    image::load_from_memory(&bytes)
-        .map_err(|err| ApiError::BadRequest(format!("failed to decode remote image: {err}")))
+        .map_err(|err| ApiError::BadRequest(format!("failed to read response body: {err}")))?;
+
+    let is_pdf = content_type.contains("application/pdf") || bytes.starts_with(b"%PDF");
+
+    if is_pdf {
+        // Convert PDF pages to images
+        convert_pdf_to_images(&bytes)
+    } else {
+        // Load as a single image
+        let img = image::load_from_memory(&bytes)
+            .map_err(|err| ApiError::BadRequest(format!("failed to decode remote image: {err}")))?;
+        Ok(vec![img])
+    }
 }
