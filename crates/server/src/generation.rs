@@ -248,10 +248,8 @@ fn flatten_content(content: &MessageContent) -> Result<(String, Vec<DynamicImage
                 match part {
                     MessagePart::ImageUrl { image_url } | MessagePart::InputImage { image_url } => {
                         let mut loaded_images = load_image_or_pdf(image_url)?;
-                        // Add <image> placeholder for each page/image
-                        for _ in 0..loaded_images.len() {
-                            buffer.push_str("<image>");
-                        }
+                        // Add one <image> placeholder (PDFs are now concatenated into a single image)
+                        buffer.push_str("<image>");
                         images.append(&mut loaded_images);
                     }
                     MessagePart::Text { text } | MessagePart::InputText { text } => {
@@ -290,8 +288,15 @@ fn convert_pdf_to_images(pdf_data: &[u8]) -> Result<Vec<DynamicImage>, ApiError>
         .load_pdf_from_byte_slice(pdf_data, None)
         .map_err(|err| ApiError::BadRequest(format!("failed to load PDF: {err}")))?;
 
-    let mut images = Vec::new();
+    if document.pages().len() == 0 {
+        return Err(ApiError::BadRequest("PDF contains no pages".into()));
+    }
 
+    let mut page_images = Vec::new();
+    let mut max_width = 0u32;
+    let mut total_height = 0u32;
+
+    // Render all pages
     for page_index in 0..document.pages().len() {
         let page = document
             .pages()
@@ -316,14 +321,27 @@ fn convert_pdf_to_images(pdf_data: &[u8]) -> Result<Vec<DynamicImage>, ApiError>
         let img = image::RgbaImage::from_raw(width, height, buffer)
             .ok_or_else(|| ApiError::Internal(format!("failed to create image from PDF page {}", page_index)))?;
 
-        images.push(DynamicImage::ImageRgba8(img));
+        max_width = max_width.max(width);
+        total_height += height;
+        page_images.push(img);
     }
 
-    if images.is_empty() {
-        return Err(ApiError::BadRequest("PDF contains no pages".into()));
+    // Concatenate all pages vertically into a single image
+    let mut combined = image::RgbaImage::new(max_width, total_height);
+    let mut y_offset = 0u32;
+
+    for page_img in page_images {
+        let page_width = page_img.width();
+        let page_height = page_img.height();
+
+        // Center the page horizontally if it's narrower than max_width
+        let x_offset = (max_width - page_width) / 2;
+
+        image::imageops::overlay(&mut combined, &page_img, x_offset as i64, y_offset as i64);
+        y_offset += page_height;
     }
 
-    Ok(images)
+    Ok(vec![DynamicImage::ImageRgba8(combined)])
 }
 
 fn load_data_url_or_pdf(data: &str) -> Result<Vec<DynamicImage>, ApiError> {
