@@ -41,6 +41,11 @@ pub async fn generate_async(
     params: DecodeParameters,
     stream: Option<StreamContext>,
 ) -> Result<GenerationResult, ApiError> {
+    // If there are multiple images (e.g., multi-page PDF), process each separately
+    if images.len() > 1 {
+        return generate_multipage_async(inputs, prompt, images, params, stream).await;
+    }
+
     let stream_for_block = stream.clone();
     let join_result = tokio::task::spawn_blocking(move || {
         generate_blocking(
@@ -71,6 +76,58 @@ pub async fn generate_async(
             Err(api_err)
         }
     }
+}
+
+async fn generate_multipage_async(
+    inputs: GenerationInputs,
+    prompt: String,
+    images: Vec<DynamicImage>,
+    params: DecodeParameters,
+    _stream: Option<StreamContext>,
+) -> Result<GenerationResult, ApiError> {
+    let mut combined_text = String::new();
+    let mut total_prompt_tokens = 0;
+    let mut total_response_tokens = 0;
+
+    // Process each page separately
+    for (page_num, image) in images.into_iter().enumerate() {
+        let page_inputs = inputs.clone();
+        let page_prompt = prompt.replace("<image><image>", "<image>")
+            .replacen("<image>", "<image>", 1); // Keep only first <image> placeholder
+        let page_params = params.clone();
+
+        let join_result = tokio::task::spawn_blocking(move || {
+            generate_blocking(
+                &page_inputs.model,
+                Arc::clone(&page_inputs.tokenizer),
+                page_prompt,
+                vec![image],
+                page_inputs.vision,
+                page_params,
+                None,
+            )
+        })
+        .await;
+
+        let result = match join_result {
+            Ok(Ok(r)) => r,
+            Ok(Err(err)) => return Err(err),
+            Err(err) => return Err(ApiError::Internal(format!("page {} generation failed: {err}", page_num + 1))),
+        };
+
+        if !combined_text.is_empty() {
+            combined_text.push_str("\n\n<--- Page Split --->\n\n");
+        }
+        combined_text.push_str(&result.text);
+        total_prompt_tokens += result.prompt_tokens;
+        total_response_tokens += result.response_tokens;
+    }
+
+    Ok(GenerationResult {
+        text: combined_text,
+        prompt_tokens: total_prompt_tokens,
+        response_tokens: total_response_tokens,
+    })
 }
 
 fn generate_blocking(
@@ -173,6 +230,29 @@ pub fn convert_messages(
     }
 }
 
+pub fn has_multiple_images(messages: &[ApiMessage]) -> bool {
+    let mut image_count = 0;
+    for message in messages {
+        match &message.content {
+            MessageContent::Parts(parts) => {
+                for part in parts {
+                    match part {
+                        MessagePart::ImageUrl { .. } | MessagePart::InputImage { .. } => {
+                            image_count += 1;
+                            if image_count > 1 {
+                                return true;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
 fn convert_deepseek_messages(
     messages: &[ApiMessage],
 ) -> Result<(String, Vec<DynamicImage>), ApiError> {
@@ -248,8 +328,10 @@ fn flatten_content(content: &MessageContent) -> Result<(String, Vec<DynamicImage
                 match part {
                     MessagePart::ImageUrl { image_url } | MessagePart::InputImage { image_url } => {
                         let mut loaded_images = load_image_or_pdf(image_url)?;
-                        // Add one <image> placeholder (PDFs are now concatenated into a single image)
-                        buffer.push_str("<image>");
+                        // Add <image> placeholder for each image/page
+                        for _ in 0..loaded_images.len() {
+                            buffer.push_str("<image>");
+                        }
                         images.append(&mut loaded_images);
                     }
                     MessagePart::Text { text } | MessagePart::InputText { text } => {
@@ -293,17 +375,15 @@ fn convert_pdf_to_images(pdf_data: &[u8]) -> Result<Vec<DynamicImage>, ApiError>
     }
 
     let mut page_images = Vec::new();
-    let mut max_width = 0u32;
-    let mut total_height = 0u32;
 
-    // Render all pages
+    // Render each page separately at 144 DPI (matching Python implementation)
     for page_index in 0..document.pages().len() {
         let page = document
             .pages()
             .get(page_index)
             .map_err(|err| ApiError::Internal(format!("failed to get PDF page {}: {err}", page_index)))?;
 
-        // Render at 2x scale (144 DPI) for better quality OCR
+        // 144 DPI = 2x zoom from 72 DPI base
         let render_config = PdfRenderConfig::new()
             .set_target_width(2000)
             .set_maximum_width(4000)
@@ -321,27 +401,10 @@ fn convert_pdf_to_images(pdf_data: &[u8]) -> Result<Vec<DynamicImage>, ApiError>
         let img = image::RgbaImage::from_raw(width, height, buffer)
             .ok_or_else(|| ApiError::Internal(format!("failed to create image from PDF page {}", page_index)))?;
 
-        max_width = max_width.max(width);
-        total_height += height;
-        page_images.push(img);
+        page_images.push(DynamicImage::ImageRgba8(img));
     }
 
-    // Concatenate all pages vertically into a single image
-    let mut combined = image::RgbaImage::new(max_width, total_height);
-    let mut y_offset = 0u32;
-
-    for page_img in page_images {
-        let page_width = page_img.width();
-        let page_height = page_img.height();
-
-        // Center the page horizontally if it's narrower than max_width
-        let x_offset = (max_width - page_width) / 2;
-
-        image::imageops::overlay(&mut combined, &page_img, x_offset as i64, y_offset as i64);
-        y_offset += page_height;
-    }
-
-    Ok(vec![DynamicImage::ImageRgba8(combined)])
+    Ok(page_images)
 }
 
 fn load_data_url_or_pdf(data: &str) -> Result<Vec<DynamicImage>, ApiError> {
